@@ -198,6 +198,95 @@ void graph_free(Graph *g)
     free(g);
 }
 
+/* ------------------------------------------------------------------ *
+ * graph_save / graph_load — lưu và nạp đồ thị dạng binary CSR        *
+ * ------------------------------------------------------------------ */
+#define GRAPH_MAGIC  0x4246535f43535200ULL   /* "BFS_CSR\0" */
+
+int graph_save(const Graph *g, const char *path)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[GRAPH] Cannot open '%s' for writing: ", path);
+        perror("");
+        return -1;
+    }
+
+    uint64_t magic = GRAPH_MAGIC;
+    int32_t  n     = (int32_t)g->num_vertices;
+    int64_t  m     = (int64_t)g->num_edges;
+
+    if (fwrite(&magic,       sizeof(uint64_t), 1,        f) != 1 ||
+        fwrite(&n,           sizeof(int32_t),  1,        f) != 1 ||
+        fwrite(&m,           sizeof(int64_t),  1,        f) != 1 ||
+        fwrite(g->row_ptr,   sizeof(int64_t),  (size_t)(n + 1), f) != (size_t)(n + 1) ||
+        fwrite(g->adj,       sizeof(int32_t),  (size_t)m,       f) != (size_t)m)
+    {
+        fprintf(stderr, "[GRAPH] Write error on '%s'\n", path);
+        fclose(f);
+        return -1;
+    }
+
+    fclose(f);
+    fprintf(stderr, "[GRAPH] Saved graph to '%s' "
+            "(n=%d, m=%lld, %.1f MB)\n",
+            path, n, (long long)m,
+            (double)(sizeof(int64_t)*(n+1) + sizeof(int32_t)*m) / (1024*1024));
+    return 0;
+}
+
+Graph *graph_load(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[GRAPH] Cannot open '%s' for reading: ", path);
+        perror("");
+        return NULL;
+    }
+
+    uint64_t magic = 0;
+    int32_t  n     = 0;
+    int64_t  m     = 0;
+
+    if (fread(&magic, sizeof(uint64_t), 1, f) != 1 || magic != GRAPH_MAGIC) {
+        fprintf(stderr, "[GRAPH] '%s': bad magic — không phải file đồ thị hợp lệ\n", path);
+        fclose(f); return NULL;
+    }
+    if (fread(&n, sizeof(int32_t), 1, f) != 1 || n <= 0) {
+        fprintf(stderr, "[GRAPH] '%s': invalid num_vertices\n", path);
+        fclose(f); return NULL;
+    }
+    if (fread(&m, sizeof(int64_t), 1, f) != 1 || m < 0) {
+        fprintf(stderr, "[GRAPH] '%s': invalid num_edges\n", path);
+        fclose(f); return NULL;
+    }
+
+    Graph *g = (Graph *)malloc(sizeof(Graph));
+    if (!g) { fclose(f); return NULL; }
+
+    g->num_vertices = (vertex_t)n;
+    g->num_edges    = (edge_t)m;
+    g->row_ptr = (edge_t   *)malloc((size_t)(n + 1) * sizeof(edge_t));
+    g->adj     = (vertex_t *)malloc((size_t)m        * sizeof(vertex_t));
+
+    if (!g->row_ptr || !g->adj) {
+        fprintf(stderr, "[GRAPH] malloc failed when loading '%s'\n", path);
+        free(g->row_ptr); free(g->adj); free(g); fclose(f); return NULL;
+    }
+
+    if (fread(g->row_ptr, sizeof(int64_t), (size_t)(n + 1), f) != (size_t)(n + 1) ||
+        fread(g->adj,     sizeof(int32_t), (size_t)m,       f) != (size_t)m)
+    {
+        fprintf(stderr, "[GRAPH] Read error on '%s' — file bị cắt?\n", path);
+        free(g->row_ptr); free(g->adj); free(g); fclose(f); return NULL;
+    }
+
+    fclose(f);
+    fprintf(stderr, "[GRAPH] Loaded graph from '%s' "
+            "(n=%d, m=%lld)\n", path, n, (long long)m);
+    return g;
+}
+
 /* ------------------------------------------------------------------ */
 void graph_print_info(const Graph *g)
 {

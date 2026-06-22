@@ -193,22 +193,39 @@ static void bottom_up_step(const Graph    *g,
  *                                                                      *
  * dist[v] = -1 (chưa thăm) hoặc >= 0 (khoảng cách).                  *
  * MAX của các giá trị -1 và k = k → dùng MAX để merge.                 *
+ *                                                                      *
+ * BỔ SUNG: trả về thời gian (giây) rank này "ở trong" lệnh Allreduce, *
+ * đo bằng MPI_Wtime() ngay trước/sau lệnh gọi. Vì Allreduce là hàm    *
+ * blocking đồng bộ tập thể, thời gian này gồm CẢ thời gian chờ các    *
+ * rank chậm hơn tới điểm đồng bộ (wait time do mất cân bằng tải)      *
+ * LẪN thời gian truyền dữ liệu thực sự — hai thành phần không tách    *
+ * rời được nếu chỉ đo từ phía 1 rank, nên báo cáo gọi chung là        *
+ * "communication time" (đúng tinh thần đề bài: cột màu thứ 2 trong    *
+ * biểu đồ load-balancing).                                            *
  * ------------------------------------------------------------------ */
-static void sync_dist(int *dist, vertex_t n)
+static double sync_dist(int *dist, vertex_t n)
 {
+    double t0 = MPI_Wtime();
     MPI_Allreduce(MPI_IN_PLACE, dist, (int)n, MPI_INT, MPI_MAX,
                   MPI_COMM_WORLD);
+    return MPI_Wtime() - t0;
 }
 
 /* ------------------------------------------------------------------ *
  * Đồng bộ frontier bitmap bằng MPI_Allreduce (OR)                      *
+ * Trả về thời gian (giây) trong Allreduce (xem giải thích ở sync_dist) *
+ * KHÔNG tính thời gian frontier_build_dense() vào comm time, vì đó    *
+ * là tính toán cục bộ (xây lại mảng dense[] từ bitmap, không có MPI). *
  * ------------------------------------------------------------------ */
-static void sync_frontier(Frontier *f)
+static double sync_frontier(Frontier *f)
 {
     size_t nw = ((size_t)f->n + WORD_BITS - 1) / WORD_BITS;
+    double t0 = MPI_Wtime();
     MPI_Allreduce(MPI_IN_PLACE, f->bitmap, (int)nw, MPI_UINT64_T,
                   MPI_BOR, MPI_COMM_WORLD);
+    double comm_dt = MPI_Wtime() - t0;
     frontier_build_dense(f);
+    return comm_dt;
 }
 
 /* ================================================================== *
@@ -255,6 +272,12 @@ BFSResult bfs_hybrid(const Graph *g, vertex_t source)
     Timer wall;
     if (my_rank == 0) timer_start(&wall);
 
+    /* ---- Bộ đếm thời gian compute / comm của RANK NÀY -------------- *
+     * Cộng dồn qua toàn bộ vòng lặp BFS (mọi level).                   *
+     * Đơn vị tích lũy nội bộ: giây (MPI_Wtime), đổi sang ms khi xuất.  */
+    double rank_compute_s = 0.0;
+    double rank_comm_s    = 0.0;
+
     /* ================================================================ *
      * VÒNG LẶP BFS THEO LEVEL                                          *
      * ================================================================ */
@@ -263,18 +286,20 @@ BFSResult bfs_hybrid(const Graph *g, vertex_t source)
 
         edge_t frontier_edges = 0;
 
-        /* Đếm tổng cạnh của frontier (để quyết định switch) */
+        /* Đếm tổng cạnh của frontier (để quyết định switch) — tính toán   *
+         * cục bộ, OpenMP song song, KHÔNG có giao tiếp MPI → tính compute */
+        double t_compute0 = MPI_Wtime();
         edge_t fe_local = 0;
         #pragma omp parallel for reduction(+:fe_local)
         for (vertex_t fi = 0; fi < curr->size; fi++)
             fe_local += graph_degree(g, curr->dense[fi]);
+        rank_compute_s += MPI_Wtime() - t_compute0;
 
-        /* MPI reduce frontier_edges */
-        /* Mỗi rank chỉ đếm phần frontier của mình → đã tính toàn bộ  *
-         * trong top_down_step, nhưng để quyết định hướng cần tổng.     *
-         * Dùng fe_local được tính local, rồi Allreduce.                */
+        /* MPI reduce frontier_edges — đây LÀ giao tiếp → tính comm */
+        double t_comm0 = MPI_Wtime();
         MPI_Allreduce(&fe_local, &frontier_edges, 1,
                       MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
+        rank_comm_s += MPI_Wtime() - t_comm0;
 
         /* ---- Quyết định hướng (Beamer et al.) ---------------------- */
         int should_bottom_up = 0;
@@ -304,31 +329,39 @@ BFSResult bfs_hybrid(const Graph *g, vertex_t source)
         /* ---- Thực hiện bước BFS ----------------------------------- */
         if (!use_bottom_up) {
             /* TOP-DOWN */
+            double t0 = MPI_Wtime();
             edge_t step_fe = 0;
             top_down_step(g, curr, next, dist, level,
                           my_rank, num_ranks, &step_fe);
+            rank_compute_s += MPI_Wtime() - t0;
 
             /* Đồng bộ dist[] và next frontier */
-            sync_dist(dist, n);
-            sync_frontier(next);
+            rank_comm_s += sync_dist(dist, n);
+            rank_comm_s += sync_frontier(next);
 
             total_visited += frontier_edges;
             unvisited_edges -= frontier_edges;
 
         } else {
             /* BOTTOM-UP */
+            double t0 = MPI_Wtime();
             bottom_up_step(g, curr, next, dist, level,
                            local_start, local_end);
+            rank_compute_s += MPI_Wtime() - t0;
 
             /* Đồng bộ dist[] và next frontier */
-            sync_dist(dist, n);
-            sync_frontier(next);
+            rank_comm_s += sync_dist(dist, n);
+            rank_comm_s += sync_frontier(next);
 
-            /* Cập nhật unvisited_edges dựa trên next frontier */
+            /* Cập nhật unvisited_edges dựa trên next frontier — tính   *
+             * toán cục bộ, không giao tiếp → tính vào compute          */
+            double t1 = MPI_Wtime();
             edge_t next_fe = 0;
             #pragma omp parallel for reduction(+:next_fe)
             for (vertex_t fi = 0; fi < next->size; fi++)
                 next_fe += graph_degree(g, next->dense[fi]);
+            rank_compute_s += MPI_Wtime() - t1;
+
             unvisited_edges -= next_fe;
             total_visited   += next_fe;
         }
@@ -347,11 +380,41 @@ BFSResult bfs_hybrid(const Graph *g, vertex_t source)
     frontier_free(curr);
     frontier_free(next);
 
+    /* ---- Thu thập thống kê per-rank về rank 0 (MPI_Gather) --------- *
+     * Mỗi rank đóng gói: rank id, compute_ms, comm_ms, total_ms,       *
+     * local_count (số đỉnh sở hữu), local_edges (tổng bậc dải đỉnh).   *
+     * local_edges dùng để minh chứng độ lệch tải do R-MAT phân phối    *
+     * bậc không đều (xem mục 4.5 / 5.3 trong báo cáo).                 *
+     * ------------------------------------------------------------------ */
+    edge_t local_edges = g->row_ptr[local_end] - g->row_ptr[local_start];
+
+    RankStats my_stats;
+    my_stats.rank        = my_rank;
+    my_stats.compute_ms  = rank_compute_s * 1000.0;
+    my_stats.comm_ms     = rank_comm_s    * 1000.0;
+    my_stats.total_ms    = my_stats.compute_ms + my_stats.comm_ms;
+    my_stats.local_count = local_end - local_start;
+    my_stats.local_edges = local_edges;
+
+    RankStats *all_stats = NULL;
+    if (my_rank == 0) {
+        all_stats = (RankStats *)malloc((size_t)num_ranks * sizeof(RankStats));
+    }
+    /* RankStats là struct kích thước cố định, dùng MPI_BYTE để gather   *
+     * đơn giản (tránh phải định nghĩa MPI_Datatype riêng).              */
+    MPI_Gather(&my_stats, sizeof(RankStats), MPI_BYTE,
+               all_stats, sizeof(RankStats), MPI_BYTE,
+               0, MPI_COMM_WORLD);
+
     /* ---- Build kết quả ------------------------------------------- */
     BFSResult result;
     result.num_levels    = num_levels;
     result.visited_edges = total_visited;
     result.time_ms       = elapsed;
+    result.compute_ms    = my_stats.compute_ms;  /* của rank gọi hàm này */
+    result.comm_ms       = my_stats.comm_ms;
+    result.rank_stats    = all_stats;             /* NULL nếu my_rank != 0 */
+    result.num_ranks     = num_ranks;
 
     if (my_rank == 0) {
         result.dist = dist;
@@ -365,8 +428,13 @@ BFSResult bfs_hybrid(const Graph *g, vertex_t source)
 
 void bfs_result_free(BFSResult *r)
 {
-    if (r && r->dist) {
+    if (!r) return;
+    if (r->dist) {
         free(r->dist);
         r->dist = NULL;
+    }
+    if (r->rank_stats) {
+        free(r->rank_stats);
+        r->rank_stats = NULL;
     }
 }

@@ -61,4 +61,18 @@ static inline edge_t graph_degree(const Graph *g, vertex_t v)
     return g->row_ptr[v + 1] - g->row_ptr[v];
 }
 
+
+/* ------------------------------------------------------------------ *
+ * Save / Load graph sang file nhị phân                                *
+ *                                                                      *
+ * Format file:                                                         *
+ *   [4 bytes] magic  0x42465347 ("BFSG")                              *
+ *   [4 bytes] num_vertices                                             *
+ *   [8 bytes] num_edges                                                *
+ *   [(num_vertices+1) * 8 bytes] row_ptr[]                             *
+ *   [num_edges * 4 bytes] adj[]                                        *
+ * ------------------------------------------------------------------ */
+int    graph_save(const Graph *g, const char *filename);
+Graph *graph_load(const char *filename);
+
 #endif /* GRAPH_H */

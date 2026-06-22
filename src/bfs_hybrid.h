@@ -44,6 +44,28 @@ static inline vertex_t partition_end(vertex_t n, int num_ranks, int rank)
 }
 
 /* ------------------------------------------------------------------ *
+ * Thống kê thời gian theo từng MPI rank                                *
+ *                                                                      *
+ * compute_ms : tổng thời gian rank này thực sự tính toán               *
+ *              (top_down_step / bottom_up_step + đếm fe_local),        *
+ *              cộng dồn qua mọi level.                                 *
+ * comm_ms    : tổng thời gian rank này đứng "trong" các lệnh           *
+ *              MPI_Allreduce (gồm cả thời gian chờ rank chậm nhất       *
+ *              tới điểm đồng bộ — đây chính là phần thời gian rảnh/     *
+ *              chờ theo nghĩa load-imbalance), cộng dồn qua mọi level.  *
+ * total_ms   : compute_ms + comm_ms (xấp xỉ thời gian sống của rank    *
+ *              trong toàn bộ vòng lặp BFS).                            *
+ * ------------------------------------------------------------------ */
+typedef struct {
+    int      rank;
+    double   compute_ms;
+    double   comm_ms;
+    double   total_ms;
+    vertex_t local_count;    /* số đỉnh sở hữu (local_end - local_start) */
+    edge_t   local_edges;    /* tổng bậc (số cạnh) của dải đỉnh sở hữu   */
+} RankStats;
+
+/* ------------------------------------------------------------------ *
  * Kết quả BFS                                                          *
  * ------------------------------------------------------------------ */
 typedef struct {
@@ -51,6 +73,19 @@ typedef struct {
     int      num_levels;     /* số mức BFS                              */
     edge_t   visited_edges;  /* tổng số cạnh duyệt qua                 */
     double   time_ms;        /* thời gian tổng (wall-clock của rank 0)  */
+
+    /* ---- Bổ sung: phân tách compute / communication --------------- *
+     * Đo trên rank 0 (rank gọi bfs_hybrid và giữ kết quả).             *
+     * compute_ms + comm_ms xấp xỉ time_ms (có thể lệch nhỏ do phần     *
+     * code ngoài 2 vùng đo, ví dụ overhead vòng lặp, swap con trỏ...). */
+    double   compute_ms;     /* tổng thời gian tính toán của rank 0     */
+    double   comm_ms;        /* tổng thời gian trong Allreduce của rank 0 */
+
+    /* ---- Bổ sung: thống kê toàn bộ rank (chỉ hợp lệ ở rank 0) ------ *
+     * Mảng kích thước num_ranks, lấy được qua MPI_Gather.              *
+     * NULL ở các rank != 0.                                            */
+    RankStats *rank_stats;
+    int        num_ranks;
 } BFSResult;
 
 /* ------------------------------------------------------------------ *
@@ -71,7 +106,7 @@ typedef struct {
  */
 BFSResult bfs_hybrid(const Graph *g, vertex_t source);
 
-/* Giải phóng bộ nhớ trong BFSResult */
+/* Giải phóng bộ nhớ trong BFSResult (gồm cả dist[] và rank_stats[]) */
 void bfs_result_free(BFSResult *r);
 
 #endif /* BFS_HYBRID_H */
