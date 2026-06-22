@@ -25,11 +25,13 @@ phân tán trên nhiều máy (cluster) sử dụng MPI + OpenMP hybrid.
 7. [Tham số dòng lệnh](#7-tham-số-dòng-lệnh)
 8. [Benchmark tự động (thí nghiệm báo cáo)](#8-benchmark-tự-động--thí-nghiệm-báo-cáo)
    - [Cấu hình script](#81-cấu-hình-script-trước-khi-chạy)
-   - [Thí nghiệm 5.1 — Verify](#82-thí-nghiệm-51--verify-correctness)
-   - [Thí nghiệm 5.2 — Scan N](#83-thí-nghiệm-52--scan-n-tìm-kích-thước-chạy-2-3-phút)
-   - [Thí nghiệm 5.3 — Granularity / Load Balancing](#84-thí-nghiệm-53--granularity--load-balancing)
-   - [Thí nghiệm 5.4 — Speedup](#85-thí-nghiệm-54--speedup)
-   - [Cấu trúc CSV output](#86-cấu-trúc-csv-output)
+   - [Quy trình khuyến nghị](#82-quy-trình-khuyến-nghị)
+   - [gen-graph — Sinh đồ thị 1 lần](#83-gen-graph--sinh-đồ-thị-1-lần-dùng-lại-nhiều-lần)
+   - [Thí nghiệm 5.1 — Verify](#84-thí-nghiệm-51--verify-correctness)
+   - [Thí nghiệm 5.2 — Scan N](#85-thí-nghiệm-52--scan-n-tìm-kích-thước-chạy-2-3-phút)
+   - [Thí nghiệm 5.3 — Granularity / Load Balancing](#86-thí-nghiệm-53--granularity--load-balancing)
+   - [Thí nghiệm 5.4 — Speedup](#87-thí-nghiệm-54--speedup)
+   - [Cấu trúc CSV output](#88-cấu-trúc-csv-output)
 9. [Kết quả mẫu](#9-kết-quả-mẫu)
 10. [Xử lý lỗi thường gặp](#10-xử-lý-lỗi-thường-gặp)
 11. [Các hàm MPI được dùng](#11-các-hàm-mpi-được-dùng)
@@ -45,16 +47,21 @@ bfs-project/
 │   ├── main_hybrid.c       ← Entry point BFS hybrid (MPI + OpenMP)
 │   ├── bfs_sequential.c/h  ← BFS queue-based tiêu chuẩn
 │   ├── bfs_hybrid.c/h      ← Direction-optimizing + MPI + OpenMP
-│   │                          (đã bổ sung đo compute/comm time per-rank)
-│   ├── graph.c/h           ← R-MAT generator, định dạng CSR
+│   │                          (bổ sung đo compute/comm time per-rank)
+│   ├── graph.c/h           ← R-MAT generator, CSR, save/load binary
 │   └── utils.c/h           ← Timer, MTEPS, verify
 ├── scripts/
 │   └── run_benchmark.sh    ← Benchmark tự động 4 thí nghiệm, xuất CSV
-├── results/                ← Output CSV (tự tạo khi chạy benchmark)
+├── graphs/                 ← File đồ thị đã sinh (*.bin) — tự tạo khi chạy gen-graph
+├── results/                ← Output CSV — tự tạo khi chạy benchmark
 ├── hostfile                ← Danh sách nodes cluster (điền trước khi chạy)
 ├── Makefile
 └── README.md
 ```
+
+> **Lưu ý `graphs/`:** Thư mục này lưu đồ thị đã sinh dưới dạng binary CSR.
+> Sinh 1 lần, dùng lại nhiều lần — tránh tốn hàng chục phút gen đồ thị
+> mỗi lần chạy benchmark. Xem mục 8.3 để biết cách sử dụng.
 
 ---
 
@@ -76,7 +83,7 @@ Ma trận kề được chia đệ quy thành 4 góc với xác suất a, b, c, 
 Mỗi cạnh được đặt vào một góc ngẫu nhiên, lặp lại log2(n) lần.
 → Tạo ra đồ thị có phân phối bậc power-law (giống mạng xã hội thực tế)
 → Đỉnh chỉ số nhỏ có xu hướng bậc cao hơn (do a >> d) — ảnh hưởng trực
-   tiếp đến cân bằng tải giữa các MPI rank (xem mục 8.4)
+   tiếp đến cân bằng tải giữa các MPI rank (xem mục 8.6)
 ```
 
 ### Direction-Optimizing BFS (Beamer et al. 2012)
@@ -179,10 +186,16 @@ make verify      # Verify correctness với graph nhỏ (100k đỉnh)
 ### BFS tuần tự (baseline)
 
 ```bash
-./bfs_seq <num_vertices> <scale_factor> <seed>
+./bfs_seq <num_vertices> <scale_factor> <seed> [options]
 
-# Ví dụ: 1 triệu đỉnh, bậc trung bình 16, seed 42
+# Gen + chạy BFS
 ./bfs_seq 1000000 16 42
+
+# Gen + lưu đồ thị ra file để dùng lại
+./bfs_seq 1000000 16 42 --save-graph graphs/g1M.bin
+
+# Load đồ thị từ file (bỏ qua bước gen, nhanh hơn nhiều)
+./bfs_seq 1000000 16 42 --graph graphs/g1M.bin
 ```
 
 ### BFS hybrid — 1 máy
@@ -191,18 +204,24 @@ make verify      # Verify correctness với graph nhỏ (100k đỉnh)
 OMP_NUM_THREADS=<threads> mpirun -np <ranks> \
     ./bfs_hybrid <num_vertices> <scale_factor> <seed> [options]
 
-# Ví dụ: 4 rank × 2 thread = 8 cores tổng
+# Gen + chạy BFS cơ bản (4 rank × 2 thread = 8 cores)
 OMP_NUM_THREADS=2 mpirun -np 4 ./bfs_hybrid 1000000 16 42
 
-# Thêm --verify để so sánh kết quả với sequential
-OMP_NUM_THREADS=2 mpirun -np 4 ./bfs_hybrid 1000000 16 42 --verify
-
-# Xuất kết quả ra CSV (dùng cho thí nghiệm 5.2, 5.4)
+# Load từ file (tất cả rank load song song — bỏ qua gen)
 OMP_NUM_THREADS=2 mpirun -np 4 ./bfs_hybrid 1000000 16 42 \
-    --csv results/summary.csv
+    --graph graphs/g1M.bin
 
-# Xuất thêm per-rank breakdown (dùng cho thí nghiệm 5.3)
+# Load + verify kết quả
 OMP_NUM_THREADS=2 mpirun -np 4 ./bfs_hybrid 1000000 16 42 \
+    --graph graphs/g1M.bin --verify
+
+# Load + xuất CSV tổng hợp (mục 5.2, 5.4)
+OMP_NUM_THREADS=2 mpirun -np 4 ./bfs_hybrid 1000000 16 42 \
+    --graph graphs/g1M.bin --csv results/summary.csv
+
+# Load + xuất cả per-rank breakdown (mục 5.3)
+OMP_NUM_THREADS=2 mpirun -np 4 ./bfs_hybrid 1000000 16 42 \
+    --graph graphs/g1M.bin \
     --csv results/summary.csv \
     --csv-ranks results/ranks.csv
 ```
@@ -362,8 +381,9 @@ EOF
 
 ### 6.4. Cấu hình NFS chia sẻ thư mục code
 
-NFS cho phép tất cả worker đọc binary từ node01, không cần copy thủ công.
-Build 1 lần trên node01 → tất cả nodes dùng được ngay.
+NFS cho phép tất cả worker đọc binary và file đồ thị từ node01 mà không
+cần copy thủ công. Build 1 lần + gen graph 1 lần trên node01 → tất cả
+nodes dùng được ngay.
 
 #### Trên node01 — Cài và cấu hình NFS server
 
@@ -401,9 +421,10 @@ sudo mkdir -p /home/mpiuser
 # Mount thử
 sudo mount 192.168.1.101:/home/mpiuser /home/mpiuser
 
-# Kiểm tra
+# Kiểm tra — phải thấy cả binary lẫn thư mục graphs/
 df -h | grep mpiuser
-ls /home/mpiuser/bfs-project/   # Phải thấy file từ node01
+ls /home/mpiuser/bfs-project/
+ls /home/mpiuser/bfs-project/graphs/    # Thấy *.bin sau khi gen-graph
 ```
 
 #### Cấu hình mount tự động khi khởi động
@@ -471,8 +492,7 @@ node03 slots=4    # máy 4-core
 ```
 
 > `slots` xác định số MPI process tối đa trên node đó.
-> Script benchmark (mục 8) đọc giá trị `TOTAL_CORES` từ cấu hình — hãy
-> đặt khớp với tổng `slots` trong hostfile.
+> Script benchmark đọc `TOTAL_CORES` — đặt bằng tổng `slots` trong hostfile.
 
 ---
 
@@ -519,12 +539,6 @@ EOF
 mpicc -fopenmp /tmp/hello_mpi.c -o /tmp/hello_mpi
 
 OMP_NUM_THREADS=2 mpirun -np 6 --hostfile hostfile /tmp/hello_mpi
-
-# Kết quả mong đợi:
-# Rank 0/6 | Host: node01 | Thread 0/2
-# Rank 0/6 | Host: node01 | Thread 1/2
-# Rank 2/6 | Host: node02 | Thread 0/2
-# ...
 ```
 
 Nếu thấy tất cả nodes xuất hiện → cluster sẵn sàng.
@@ -543,21 +557,21 @@ cd ~/bfs-project
 # 2. Build (chỉ cần làm trên node01, NFS tự sync sang worker)
 make
 
-# 3. Chạy sequential lấy baseline
-./bfs_seq 4000000 16 42
+# 3. Gen + lưu đồ thị 1 lần (rank 0 lưu, NFS sync sang worker tự động)
+OMP_NUM_THREADS=1 mpirun -np 1 --hostfile hostfile \
+    ./bfs_hybrid 4000000 16 42 --save-graph graphs/g4M.bin
 
-# 4. Chạy BFS hybrid trên cluster
-# 3 node × 4 rank/node = 12 rank, mỗi rank 1 thread
+# 4. Chạy BFS hybrid load từ file (nhanh, không gen lại)
 OMP_NUM_THREADS=1 mpirun -np 12 --hostfile hostfile \
-    ./bfs_hybrid 4000000 16 42
+    ./bfs_hybrid 4000000 16 42 --graph graphs/g4M.bin
 
 # 5. Kèm --verify để kiểm tra kết quả đúng/sai
 OMP_NUM_THREADS=1 mpirun -np 12 --hostfile hostfile \
-    ./bfs_hybrid 1000000 16 42 --verify
+    ./bfs_hybrid 1000000 16 42 --graph graphs/g1M.bin --verify
 
 # 6. Xuất CSV để vẽ biểu đồ báo cáo
 OMP_NUM_THREADS=1 mpirun -np 12 --hostfile hostfile \
-    ./bfs_hybrid 4000000 16 42 \
+    ./bfs_hybrid 4000000 16 42 --graph graphs/g4M.bin \
     --csv results/summary.csv \
     --csv-ranks results/ranks.csv
 ```
@@ -565,41 +579,56 @@ OMP_NUM_THREADS=1 mpirun -np 12 --hostfile hostfile \
 #### Các tuỳ chọn hữu ích của mpirun
 
 ```bash
-# 1 process mỗi node (test topology)
-mpirun -np 3 --hostfile hostfile \
-    --map-by node ./bfs_hybrid 1000000 16 42
-
 # Bind process theo core (tăng performance trên cluster thật)
 mpirun -np 12 --hostfile hostfile \
-    --bind-to core ./bfs_hybrid 4000000 16 42
+    --bind-to core ./bfs_hybrid 4000000 16 42 --graph graphs/g4M.bin
 
 # Xem chi tiết process được spawn ở đâu
 mpirun -np 12 --hostfile hostfile \
-    --display-map ./bfs_hybrid 1000000 16 42
+    --display-map ./bfs_hybrid 1000000 16 42 --graph graphs/g1M.bin
 
 # Ép chạy dù không đủ slot (khi test oversubscribe)
 mpirun -np 24 --hostfile hostfile \
-    --oversubscribe ./bfs_hybrid 1000000 16 42
+    --oversubscribe ./bfs_hybrid 1000000 16 42 --graph graphs/g1M.bin
 ```
 
 ---
 
 ## 7. Tham số dòng lệnh
 
-### `bfs_hybrid` — tất cả tham số
+### `bfs_hybrid` và `bfs_seq` — đầy đủ tất cả tham số
 
 ```
 mpirun -np <P> ./bfs_hybrid <num_vertices> <scale_factor> <seed> [options]
+                ./bfs_seq   <num_vertices> <scale_factor> <seed> [options]
 ```
 
 | Tham số / Flag | Bắt buộc | Ý nghĩa | Ví dụ |
 |---|---|---|---|
 | `num_vertices` | ✓ | Số đỉnh (làm tròn lên lũy thừa 2) | `4000000` → thực tế `4194304` |
-| `scale_factor` | ✓ | Bậc trung bình mỗi đỉnh (~mật độ cạnh) | `16` |
+| `scale_factor` | ✓ | Bậc trung bình mỗi đỉnh | `16` |
 | `seed` | ✓ | Random seed — giữ cố định để so sánh | `42` |
-| `--verify` | — | So sánh dist[] với BFS tuần tự | (flag) |
-| `--csv <file>` | — | Ghi 1 dòng tổng hợp vào CSV (append) | `results/summary.csv` |
-| `--csv-ranks <file>` | — | Ghi per-rank breakdown vào CSV (append) | `results/ranks.csv` |
+| `--graph <file>` | — | **Load đồ thị từ file binary** thay vì gen R-MAT. Tất cả MPI rank load song song, độc lập. 3 tham số đầu vẫn phải truyền (dùng để ghi CSV) nhưng không ảnh hưởng cấu trúc đồ thị | `graphs/g4M.bin` |
+| `--save-graph <file>` | — | Sau khi gen R-MAT, **lưu đồ thị ra file binary** (chỉ rank 0 ghi). Dùng kết hợp với lần chạy đầu tiên để tạo file cho các lần sau | `graphs/g4M.bin` |
+| `--verify` | — | So sánh `dist[]` của hybrid với BFS tuần tự | (flag) |
+| `--csv <file>` | — | Ghi 1 dòng tổng hợp vào CSV (append, tạo header nếu chưa có) | `results/summary.csv` |
+| `--csv-ranks <file>` | — | Ghi per-rank breakdown vào CSV (1 dòng/rank, append) | `results/ranks.csv` |
+
+> **`--graph` và `--save-graph` không dùng được cùng lúc.** Một là load từ
+> file (không gen), một là gen xong thì lưu — hai hướng ngược nhau.
+
+### Format file đồ thị binary (`.bin`)
+
+```
+[8 bytes]  magic    = 0x4246535f43535200  ("BFS_CSR\0")
+[4 bytes]  n        = num_vertices  (int32_t)
+[8 bytes]  m        = num_edges     (int64_t)
+[8*(n+1)]  row_ptr  (int64_t × n+1)
+[4*m]      adj      (int32_t × m)
+```
+
+Kích thước xấp xỉ: `8×(n+1) + 4×m` bytes.
+Ví dụ: graph 4M đỉnh, 16 bậc trung bình ≈ 4M×16×4×2 ≈ **512 MB**.
 
 ### Biến môi trường
 
@@ -618,7 +647,7 @@ mpirun -np <P> ./bfs_hybrid <num_vertices> <scale_factor> <seed> [options]
 
 ## 8. Benchmark tự động — Thí nghiệm báo cáo
 
-Script `scripts/run_benchmark.sh` tự động hoá 4 thí nghiệm trong báo cáo,
+Script `scripts/run_benchmark.sh` tự động hoá toàn bộ thí nghiệm báo cáo,
 xuất kết quả ra `results/*.csv` theo từng timestamp.
 
 ### 8.1. Cấu hình script trước khi chạy
@@ -633,8 +662,8 @@ HOSTFILE="hostfile" # Đường dẫn hostfile (để rỗng "" nếu chỉ ch�
 OVERSUBSCRIBE=0     # 0 = tắt (chạy thật trên cluster), 1 = bật (debug local)
 
 # ---- Tham số đồ thị ------------------------------------------------------
-SCALE=16            # bậc trung bình — GIỮ NGUYÊN xuyên suốt mọi thí nghiệm
-SEED=42             # seed cố định — GIỮ NGUYÊN xuyên suốt mọi thí nghiệm
+SCALE=16            # Bậc trung bình — GIỮ NGUYÊN xuyên suốt mọi thí nghiệm
+SEED=42             # Seed cố định — GIỮ NGUYÊN xuyên suốt mọi thí nghiệm
 
 # ---- Mục 5.2: danh sách N để quét ----------------------------------------
 SCAN_N_LIST=(500000 1000000 2000000 4000000 8000000 16000000)
@@ -645,64 +674,121 @@ GRANULARITY_N=4000000    # ← ĐIỀN GIÁ TRỊ N0 thật sau khi chạy thí 
 # SPEEDUP_N tự động = 2 × GRANULARITY_N (mục 5.4) — không cần sửa tay
 ```
 
-> **Lưu ý quan trọng về `SEED`:** Giữ cùng 1 giá trị seed xuyên suốt
-> toàn bộ 4 thí nghiệm để các lần chạy dùng cùng 1 đồ thị logic và có
-> thể so sánh công bằng với nhau (chỉ khác N/P, không khác cấu trúc đồ thị).
+> **Lưu ý `SEED`:** Giữ cùng 1 giá trị seed xuyên suốt toàn bộ thí nghiệm.
+> Script tự đặt tên file graph theo `g<N>_s<SCALE>_seed<SEED>.bin` —
+> đổi seed là đổi file, không tái sử dụng được file cũ.
 
 ---
 
-### 8.2. Thí nghiệm 5.1 — Verify Correctness
+### 8.2. Quy trình khuyến nghị
 
-**Mục tiêu:** Xác nhận `dist[]` của bản hybrid giống hệt bản tuần tự
-trên nhiều cấu hình N/P khác nhau, chứng minh tính đúng đắn ổn định.
+```
+Bước 0: Cấu hình script (TOTAL_CORES, HOSTFILE, SCAN_N_LIST...)
+         ↓
+Bước 1: gen-graph  → sinh + lưu đồ thị cho mọi N vào graphs/*.bin
+         ↓
+Bước 2: scan-n     → tìm N₀ (thời gian chạy 2-3 phút)
+         ↓
+Bước 3: Điền N₀ vào GRANULARITY_N trong script
+         ↓
+Bước 4: granular   → đo load balancing tại N₀
+         ↓
+Bước 5: speedup    → đo speedup tại 2×N₀
+```
 
 ```bash
 chmod +x scripts/run_benchmark.sh
-./scripts/run_benchmark.sh verify
+
+./scripts/run_benchmark.sh gen-graph   # Bước 1 — chạy 1 lần duy nhất
+./scripts/run_benchmark.sh scan-n      # Bước 2
+# ... điền GRANULARITY_N vào script ...
+./scripts/run_benchmark.sh granular    # Bước 4
+./scripts/run_benchmark.sh speedup     # Bước 5
 ```
-
-Script chạy `--verify` với 5 cấu hình (N nhỏ/lớn, P khác nhau).
-Kết quả in ra console và lưu log đầy đủ vào `results/verify_<timestamp>.log`.
-
-Kiểm tra nhanh: mỗi dòng phải có `PASSED ✓`, không có `FAILED ✗`.
 
 ---
 
-### 8.3. Thí nghiệm 5.2 — Scan N (tìm kích thước chạy 2-3 phút)
+### 8.3. gen-graph — Sinh đồ thị 1 lần, dùng lại nhiều lần
 
-**Mục tiêu:** Tìm N₀ sao cho thời gian BFS (không tính sinh đồ thị) nằm
-trong khoảng 2-3 phút, dùng P = TOTAL_CORES cố định.
+**Tại sao cần bước này?**
+
+R-MAT generation tốn nhiều thời gian (vài phút đến hàng chục phút tùy N)
+và chạy **tuần tự trên từng rank** (không song song hóa, lặp lại giống hệt
+trên mọi rank). Nếu không lưu, mỗi lần chạy benchmark đều phải gen lại →
+tốn thời gian vô ích. Lệnh `gen-graph` giải quyết việc này: sinh 1 lần,
+lưu vào `graphs/`, tất cả lần chạy sau load từ file (thường chỉ vài giây).
+
+```bash
+./scripts/run_benchmark.sh gen-graph
+```
+
+Script tự sinh graph cho **tất cả N** trong `SCAN_N_LIST` + `GRANULARITY_N`
++ `SPEEDUP_N` (= 2×GRANULARITY_N). File đặt tại
+`graphs/g<N>_s<SCALE>_seed<SEED>.bin`. Nếu file đã tồn tại → bỏ qua, không
+gen lại.
+
+Sau khi `gen-graph` xong, tất cả lệnh `scan-n`, `granular`, `speedup` sẽ
+**tự động phát hiện file** và thêm `--graph <file>` vào lệnh chạy — không
+cần thêm thủ công.
+
+> **Trên cluster với NFS:** gen-graph chỉ cần chạy 1 lần trên node01.
+> Thư mục `graphs/` được NFS sync sang worker tự động — mọi rank có thể
+> load ngay mà không cần copy thủ công sang từng máy.
+
+---
+
+### 8.4. Thí nghiệm 5.1 — Verify Correctness
+
+**Mục tiêu:** Xác nhận `dist[]` của bản hybrid giống hệt bản tuần tự
+trên nhiều cấu hình N/P, chứng minh tính đúng đắn ổn định.
+
+```bash
+./scripts/run_benchmark.sh verify
+# Log đầy đủ: results/verify_<timestamp>.log
+```
+
+Script chạy `--verify` với 5 cấu hình (N nhỏ/lớn, P khác nhau).
+Mỗi dòng phải có `PASSED ✓`, không có `FAILED ✗`.
+
+---
+
+### 8.5. Thí nghiệm 5.2 — Scan N (tìm kích thước chạy 2-3 phút)
+
+**Mục tiêu:** Tìm N₀ sao cho thời gian BFS nằm trong khoảng 2-3 phút,
+dùng P = TOTAL_CORES cố định.
 
 ```bash
 ./scripts/run_benchmark.sh scan-n
 # CSV: results/scan_n_<timestamp>.csv
 ```
 
-**Thời gian chương trình vs thời gian BFS:** Cột `gen_ms` (sinh đồ thị) và
-`bfs_time_ms` (BFS thật) được tách riêng trong CSV. Mục 5.2 đo `bfs_time_ms`,
-không phải `gen_ms` (sinh đồ thị chạy tuần tự trên mọi rank, không hưởng lợi
-từ song song hoá — không phải phần thuật toán đang đánh giá).
+**Quan trọng — thời gian BFS vs thời gian gen:** Cột `gen_ms` (sinh/load
+đồ thị) và `bfs_time_ms` (BFS thật sự) được tách riêng trong CSV. Mục 5.2
+nhắm vào `bfs_time_ms` — đây là phần thuật toán đang đánh giá. Nếu dùng
+`--graph` (đã gen-graph trước), `gen_ms` sẽ rất nhỏ (vài giây load file),
+phản ánh đúng chi phí thực tế của BFS.
 
 **Sau khi chạy xong:**
-1. Mở file CSV, tìm N sao cho `bfs_time_ms` nằm trong 120000–180000 ms (2-3 phút).
-2. Nếu chưa đạt: thêm giá trị N lớn hơn vào `SCAN_N_LIST` trong script, chạy lại.
-3. Sau khi chọn được N₀: điền vào `GRANULARITY_N` trong script.
+1. Mở file CSV, tìm N sao cho `bfs_time_ms` ≈ 120000–180000 ms (2-3 phút).
+2. Nếu chưa đạt: thêm N lớn hơn vào `SCAN_N_LIST`, chạy `gen-graph` thêm
+   cho N mới, rồi chạy `scan-n` lại.
+3. Điền N₀ vào `GRANULARITY_N` trong script.
 
-**Biểu đồ cần vẽ** (trục X = `num_vertices`, trục Y = thời gian ms):
-- Đường 1: `bfs_time_ms` (có thời gian truyền thông)
-- Đường 2: `bfs_time_ms - comm_ms` (không có thời gian truyền thông, rank 0)
+**Biểu đồ cần vẽ** (X = `num_vertices`, Y = thời gian ms):
+- Đường 1: `bfs_time_ms` (có communication)
+- Đường 2: `bfs_time_ms - comm_ms` (không có communication)
 
 ---
 
-### 8.4. Thí nghiệm 5.3 — Granularity / Load Balancing
+### 8.6. Thí nghiệm 5.3 — Granularity / Load Balancing
 
-**Mục tiêu:** Với N₀ và P = TOTAL_CORES cố định, kiểm tra tải có cân
-bằng giữa các tiến trình không (ngưỡng đề bài: lệch > 25% = mất cân bằng).
+**Mục tiêu:** Với N₀ và P = TOTAL_CORES cố định, kiểm tra tải có cân bằng
+không (ngưỡng đề bài: lệch > 25% = mất cân bằng).
 
 ```bash
 ./scripts/run_benchmark.sh granular
-# CSV: results/granularity_ranks_<timestamp>.csv
-#      results/granularity_summary_<timestamp>.csv
+# CSV per-rank: results/granularity_ranks_<timestamp>.csv
+# CSV summary:  results/granularity_summary_<timestamp>.csv
 ```
 
 Kết quả in thẳng ra console bao gồm bảng per-rank:
@@ -710,54 +796,56 @@ Kết quả in thẳng ra console bao gồm bảng per-rank:
 ```
 [HYBRID] Per-rank breakdown:
 [HYBRID]   rank      vertices          edges  compute(ms)  comm(ms)  total(ms)
-[HYBRID]   0            65536        3267123         8.28     12.89      21.16
-[HYBRID]   1            65536        1088780         2.86     17.30      20.16
-...
-[HYBRID]   Load imbalance (max-min)/max = 5.1% (<= 25% -> tam on)
+[HYBRID]   0           131072       8764201        31.40      8.50      39.90
+[HYBRID]   1           131072       2922800        12.10     26.80      38.90
+[HYBRID]   2           131072       2924000        13.20     25.60      38.80
+[HYBRID]   3           131072        869483        18.40     20.30      38.70
+[HYBRID]   Load imbalance (max-min)/max = 2.8% (<= 25% -> tam on)
 ```
 
 **Ý nghĩa các cột:**
-- `edges` — tổng số cạnh của dải đỉnh rank đó sở hữu (không đều nhau do R-MAT)
-- `compute_ms` — thời gian rank đó thực tế tính toán (BFS steps + đếm cục bộ)
-- `comm_ms` — thời gian rank đó "ở trong" các lệnh `MPI_Allreduce`, bao gồm
-  cả thời gian **chờ** rank chậm nhất tới điểm đồng bộ (= thời gian rảnh do lệch tải)
-- `(max-min)/max` — % lệch tải tự động tính và in ra
+
+| Cột | Ý nghĩa |
+|---|---|
+| `edges` | Tổng số cạnh của dải đỉnh rank đó sở hữu. Do R-MAT phân phối bậc lệch, đỉnh chỉ số nhỏ (rank 0) thường có nhiều cạnh hơn rõ rệt. |
+| `compute_ms` | Thời gian rank đó thực tế tính toán (BFS steps + đếm frontier_edges cục bộ) qua mọi level. |
+| `comm_ms` | Thời gian rank đó "ở trong" các lệnh `MPI_Allreduce` — bao gồm cả thời gian **chờ** rank chậm nhất tới điểm đồng bộ. Đây chính là thời gian rảnh do mất cân bằng tải. |
+| `(max-min)/max` | % lệch tải tự động tính, so sánh với ngưỡng 25% của đề bài. |
 
 **Biểu đồ cần vẽ:** Stacked bar chart — 1 cột = 1 rank, 2 màu xếp chồng
-(`compute_ms` + `comm_ms`). Lọc file CSV theo `num_vertices=N₀`, `num_ranks=TOTAL_CORES`.
+(`compute_ms` và `comm_ms`). Lọc file CSV theo `num_vertices=N₀`, `num_ranks=TOTAL_CORES`.
 
-**Nếu lệch > 25%:** Lý do là partition hiện tại chia đều theo số đỉnh (không
-theo số cạnh), trong khi R-MAT phân phối bậc lệch mạnh (đỉnh chỉ số nhỏ bậc cao
-hơn). Hướng cải tiến: chia theo số cạnh thay vì số đỉnh — đảm bảo mỗi rank
-nhận xấp xỉ `|E|/P` cạnh thay vì `|V|/P` đỉnh.
+**Nếu lệch > 25%:** Partition hiện tại chia đều theo số đỉnh, không theo số
+cạnh — trong khi R-MAT có bậc lệch mạnh (đỉnh chỉ số nhỏ bậc cao hơn).
+Hướng cải tiến: chia theo số cạnh (edge-balanced partition) thay vì số đỉnh.
 
 ---
 
-### 8.5. Thí nghiệm 5.4 — Speedup
+### 8.7. Thí nghiệm 5.4 — Speedup
 
 **Mục tiêu:** Với N = 2×N₀ cố định, quét P = 1, 2, 4, ..., 2×TOTAL_CORES.
-Vẽ biểu đồ thời gian và speedup, so sánh với đường lý tưởng Speedup = P.
+Vẽ biểu đồ thời gian và speedup so với đường lý tưởng Speedup = P.
 
 ```bash
 ./scripts/run_benchmark.sh speedup
 # CSV: results/speedup_<timestamp>.csv
 ```
 
-**Biểu đồ 1** (trục X = `num_ranks`, trục Y = thời gian ms):
+**Biểu đồ 1** (X = `num_ranks`, Y = thời gian ms):
 - Đường 1: `bfs_time_ms` (có communication)
 - Đường 2: `bfs_time_ms - comm_ms` (không có communication)
 
-**Biểu đồ 2** (trục X = `num_ranks`, trục Y = speedup):
-- Speedup(P) = `bfs_time_ms(P=1)` / `bfs_time_ms(P)` (tính từ CSV, dòng P=1 lấy làm mốc)
+**Biểu đồ 2** (X = `num_ranks`, Y = speedup):
+- `Speedup(P) = bfs_time_ms(P=1) / bfs_time_ms(P)` — tính từ CSV, dòng P=1 là mốc
 - Đường lý tưởng: Speedup = P (linear speedup)
 
-> Kỳ vọng: speedup không tuyến tính hoàn toàn khi P lớn, vì `Allreduce(dist[])`
-> truyền O(n) dữ liệu mỗi level bất kể P — overhead communication tăng tỷ lệ
-> khi thời gian tính toán/rank giảm. Đây là minh hoạ thực nghiệm của định luật Amdahl.
+> Kỳ vọng: speedup không tuyến tính khi P lớn, vì `Allreduce(dist[])`
+> truyền O(n) dữ liệu mỗi level bất kể P — đây là minh hoạ thực nghiệm
+> của định luật Amdahl.
 
 ---
 
-### 8.6. Cấu trúc CSV output
+### 8.8. Cấu trúc CSV output
 
 #### `--csv <file>` — 1 dòng / lần chạy (dùng cho 5.2, 5.4)
 
@@ -767,8 +855,9 @@ gen_ms, bfs_time_ms, compute_ms, comm_ms, num_levels, visited_edges,
 mteps, seq_time_ms, speedup, verify_errors
 ```
 
-- `compute_ms`, `comm_ms` là của **rank 0** (không phải toàn cluster)
-- `seq_time_ms`, `speedup`, `verify_errors` — để trống nếu không chạy `--verify`
+- `gen_ms` = thời gian gen R-MAT (nếu gen) hoặc thời gian load từ file (nếu dùng `--graph`)
+- `compute_ms`, `comm_ms` = của **rank 0** (đại diện)
+- `seq_time_ms`, `speedup`, `verify_errors` = để trống nếu không chạy `--verify`
 - File tự tạo header nếu chưa tồn tại, append nếu đã tồn tại
 
 #### `--csv-ranks <file>` — 1 dòng / rank / lần chạy (dùng cho 5.3)
@@ -779,16 +868,19 @@ local_vertices, local_edges, compute_ms, comm_ms, total_ms
 ```
 
 - Lọc theo `(num_vertices, num_ranks)` khi vẽ biểu đồ load-balancing
+- `local_edges` = tổng số cạnh của dải đỉnh rank đó sở hữu (minh chứng R-MAT skew)
 
 ---
 
 ## 9. Kết quả mẫu
 
-### BFS tuần tự
+### BFS tuần tự — load từ file
 
 ```
-[SEQ] Generating R-MAT graph: 500000 vertices, scale=16, seed=42
-[SEQ] Graph generated in 4868.78 ms
+[SEQ] Loading graph from 'graphs/g500k.bin' ...
+[GRAPH] Loaded graph from 'graphs/g500k.bin' (n=524288, m=15480484)
+[GRAPH] Vertices: 524288 | Edges: 15480484 | Avg degree: 29.52 | Min: 0 | Max: 67234
+[SEQ] Graph loaded in 1.87 ms
 
 [SEQ] BFS from source vertex 42
 [SEQ] Graph: 524288 vertices, 15480484 edges
@@ -797,19 +889,12 @@ local_vertices, local_edges, compute_ms, comm_ms, total_ms
 [SEQ] MTEPS: 365.65
 ```
 
-### BFS hybrid (4 rank × 2 thread = 8 cores) với per-rank breakdown
+### BFS hybrid — load từ file + verify + per-rank breakdown
 
 ```
-[HYBRID] ============================================
-[HYBRID] BFS Hybrid (MPI + OpenMP + Direction-Opt)
-[HYBRID] MPI ranks   : 4
-[HYBRID] OMP threads : 2 per rank
-[HYBRID] Total cores : 8
-[HYBRID] Alpha       : 14
-[HYBRID] Beta        : 24
-[HYBRID] ============================================
+[HYBRID] Loading graph from 'graphs/g500k.bin' ...
+[HYBRID] Graph loaded in 2.10 ms
 
-[HYBRID] Generating R-MAT graph: 500000 vertices, scale=16, seed=42
 [HYBRID] BFS from source vertex 42
 
 [HYBRID]   Level  1: top-down  (frontier=1,      fe=9888,     ue=15480484)
@@ -863,7 +948,6 @@ local_vertices, local_edges, compute_ms, comm_ms, total_ms
 
 **`ssh: connect to host node02 port 22: Connection refused`**
 ```bash
-# Kiểm tra SSH service trên node worker
 sudo systemctl status ssh
 sudo systemctl enable --now ssh
 ```
@@ -880,20 +964,36 @@ chmod 600 ~/.ssh/authorized_keys
 
 **`There are not enough slots available`**
 ```bash
-# Tăng slots trong hostfile, hoặc giảm -np
-node01 slots=4    # tăng lên theo số vCPU thật
+# Tăng slots trong hostfile theo số vCPU thật
+node01 slots=4
 
-# Hoặc thêm --oversubscribe (chỉ dùng khi debug, không dùng đo hiệu năng)
+# Hoặc thêm --oversubscribe (chỉ dùng khi debug)
 mpirun -np 8 --hostfile hostfile --oversubscribe ./bfs_hybrid ...
 ```
 
 **`No such file or directory` khi chạy trên worker**
 ```bash
-# NFS chưa mount — kiểm tra trên worker:
+# NFS chưa mount — kiểm tra trên worker
 ls ~/bfs-project/bfs_hybrid
 
-# Nếu không thấy → mount lại NFS (bước 6.4)
+# Mount lại NFS (bước 6.4)
 sudo mount 192.168.1.101:/home/mpiuser /home/mpiuser
+```
+
+**`bad magic — không phải file đồ thị hợp lệ`**
+```bash
+# File .bin bị corrupt hoặc sinh từ phiên bản cũ — xóa và gen lại
+rm graphs/g4M.bin
+./scripts/run_benchmark.sh gen-graph
+```
+
+**`Failed to load graph` khi worker không thấy file**
+```bash
+# Kiểm tra NFS đã mount và file tồn tại trên worker
+ls ~/bfs-project/graphs/
+
+# Nếu không thấy: kiểm tra NFS, hoặc copy thủ công
+scp graphs/g4M.bin mpiuser@node02:~/bfs-project/graphs/
 ```
 
 **IP VM thay đổi sau khi restart**
@@ -905,12 +1005,12 @@ sudo nano /etc/netplan/00-installer-config.yaml
 network:
   version: 2
   ethernets:
-    enp0s3:                          # Tên card — dùng `ip addr` để xem
+    enp0s3:
       dhcp4: no
-      addresses: [192.168.1.101/24]  # Đổi theo từng node
+      addresses: [192.168.1.101/24]
       routes:
         - to: default
-          via: 192.168.1.1           # Gateway router
+          via: 192.168.1.1
       nameservers:
         addresses: [8.8.8.8]
 ```
@@ -920,21 +1020,13 @@ sudo netplan apply
 
 **`Verify FAILED` — kết quả sai**
 ```bash
-# Chạy với graph nhỏ để debug
+# Debug với graph nhỏ
 OMP_NUM_THREADS=1 mpirun -np 2 ./bfs_hybrid 10000 8 42 --verify
-```
-
-**Kiểm tra version OpenMPI nhất quán**
-```bash
-# Chạy trên từng node — phải ra cùng version
-mpirun --version
-# mpirun (Open MPI) 4.1.6   ← phải giống nhau trên mọi node
 ```
 
 **Script benchmark báo lỗi `cannot open csv file`**
 ```bash
-# Thư mục results/ chưa tồn tại — tạo thủ công hoặc chạy make trước
-mkdir -p results
+mkdir -p results graphs
 ```
 
 ---
@@ -953,4 +1045,4 @@ mkdir -p results
 | `MPI_Gather` | Thu thập `RankStats` từ mọi rank về rank 0 (đo load balancing) |
 | `MPI_Abort` | Dừng khẩn cấp tất cả process khi có lỗi nghiêm trọng |
 | `MPI_Finalize` | Kết thúc MPI, giải phóng tài nguyên |
-| `MPI_Wtime` | Đo thời gian wall-clock (dùng để đo compute/comm time per-rank) |
+| `MPI_Wtime` | Đo thời gian wall-clock (đo compute/comm time per-rank) |
