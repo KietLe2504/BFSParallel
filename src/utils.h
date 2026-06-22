@@ -2,6 +2,7 @@
 #define UTILS_H
 
 #include <stdint.h>
+#include <time.h>
 #include "graph.h"
 
 /* ------------------------------------------------------------------ *
