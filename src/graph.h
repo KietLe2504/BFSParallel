@@ -61,18 +61,20 @@ static inline edge_t graph_degree(const Graph *g, vertex_t v)
     return g->row_ptr[v + 1] - g->row_ptr[v];
 }
 
-
 /* ------------------------------------------------------------------ *
- * Save / Load graph sang file nhị phân                                *
+ * Lưu / Load đồ thị dạng binary CSR                                   *
  *                                                                      *
- * Format file:                                                         *
- *   [4 bytes] magic  0x42465347 ("BFSG")                              *
- *   [4 bytes] num_vertices                                             *
- *   [8 bytes] num_edges                                                *
- *   [(num_vertices+1) * 8 bytes] row_ptr[]                             *
- *   [num_edges * 4 bytes] adj[]                                        *
+ * Format file (.bin):                                                  *
+ *   [8 bytes] magic   = 0x4246535f43535200  ("BFS_CSR\0")             *
+ *   [4 bytes] n       = num_vertices  (int32_t)                        *
+ *   [8 bytes] m       = num_edges     (int64_t)                        *
+ *   [8*(n+1) bytes]   row_ptr[]       (int64_t × n+1)                  *
+ *   [4*m bytes]       adj[]           (int32_t × m)                    *
+ *                                                                      *
+ * graph_save() : trả về 0 nếu thành công, -1 nếu lỗi.                 *
+ * graph_load() : trả về Graph* mới, NULL nếu lỗi (file sai / corrupt). *
  * ------------------------------------------------------------------ */
-int    graph_save(const Graph *g, const char *filename);
-Graph *graph_load(const char *filename);
+int    graph_save(const Graph *g, const char *path);
+Graph *graph_load(const char *path);
 
 #endif /* GRAPH_H */
