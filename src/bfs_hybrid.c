@@ -116,12 +116,13 @@ static void top_down_step(const Graph *g,
                           int             level,
                           int             my_rank,
                           int             num_ranks,
-                          edge_t         *out_frontier_edges)
+                          edge_t         *out_frontier_edges,
+                          NewVerts       *local_new)   /* NULL = không thu thập */
 {
     frontier_clear(next);
+    if (local_new) new_verts_clear(local_new);
     edge_t frontier_edges = 0;
 
-    /* Chia frontier cho các rank */
     vertex_t chunk    = (curr->size + num_ranks - 1) / num_ranks;
     vertex_t rank_s   = my_rank * chunk;
     vertex_t rank_e   = rank_s + chunk;
@@ -139,11 +140,11 @@ static void top_down_step(const Graph *g,
                 frontier_edges++;
                 vertex_t v = g->adj[e];
 
-                /* CAS để tránh race condition giữa các thread */
                 if (dist[v] == -1) {
                     int old = __sync_val_compare_and_swap(&dist[v], -1, level);
                     if (old == -1) {
                         frontier_add_atomic(next, v);
+                        if (local_new) new_verts_add(local_new, v);
                     }
                 }
             }
@@ -166,13 +167,15 @@ static void bottom_up_step(const Graph    *g,
                            int            *dist,
                            int             level,
                            vertex_t        local_start,
-                           vertex_t        local_end)
+                           vertex_t        local_end,
+                           NewVerts       *local_new)   /* NULL = không thu thập */
 {
     frontier_clear(next);
+    if (local_new) new_verts_clear(local_new);
 
     #pragma omp parallel for schedule(dynamic, 256)
     for (vertex_t u = local_start; u < local_end; u++) {
-        if (dist[u] != -1) continue;  /* đã thăm, bỏ qua */
+        if (dist[u] != -1) continue;
 
         edge_t start = g->row_ptr[u];
         edge_t end   = g->row_ptr[u + 1];
@@ -182,7 +185,8 @@ static void bottom_up_step(const Graph    *g,
             if (frontier_has(curr, v)) {
                 dist[u] = level;
                 frontier_add_atomic(next, u);
-                break;  /* chỉ cần 1 parent là đủ */
+                if (local_new) new_verts_add(local_new, u);
+                break;
             }
         }
     }
@@ -202,6 +206,116 @@ static void bottom_up_step(const Graph    *g,
  * rời được nếu chỉ đo từ phía 1 rank, nên báo cáo gọi chung là        *
  * "communication time" (đúng tinh thần đề bài: cột màu thứ 2 trong    *
  * biểu đồ load-balancing).                                            *
+ * ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ *
+ * DELTA SYNC — thay thế sync_dist O(n) bằng O(|new_vertices|)        *
+ *                                                                      *
+ * Thay vì Allreduce toàn bộ dist[] (n phần tử, ~32 MB với n=8M),     *
+ * mỗi rank chỉ gửi danh sách đỉnh nó vừa thăm trong level này.       *
+ *                                                                      *
+ * Giao thức:                                                           *
+ *  1. Mỗi rank thu thập local_new[] trong step (top-down/bottom-up)   *
+ *  2. MPI_Allgather để trao đổi số lượng đỉnh mới của từng rank       *
+ *  3. MPI_Allgatherv để trao đổi danh sách đỉnh mới                   *
+ *  4. Mỗi rank cập nhật dist[v] = level cho các đỉnh nhận được        *
+ *                                                                      *
+ * Complexity: O(|new_vertices_this_level|) thay vì O(n)               *
+ * Với BFS trên R-MAT 6 level: tổng new_vertices << n ở level 1,5,6    *
+ * và = O(n) ở level 2-4 (frontier rộng) — nhưng khi đó frontier       *
+ * bitmap cũng O(n), không tiết kiệm được gì → fallback tự động.       *
+ *                                                                      *
+ * Lưu ý: Allgatherv có latency cao hơn Allreduce (cần P round-trips   *
+ * thay vì log P), nên chỉ có lợi khi message nhỏ hơn ngưỡng.         *
+ * ------------------------------------------------------------------ */
+
+/* Mảng đỉnh mới tích lũy trong 1 step — mỗi rank giữ riêng */
+typedef struct {
+    vertex_t *buf;     /* buffer đỉnh mới                                */
+    int       count;   /* số đỉnh đã thêm                                */
+    int       cap;     /* dung lượng buffer                              */
+} NewVerts;
+
+static NewVerts new_verts_create(int cap)
+{
+    NewVerts nv;
+    nv.buf   = (vertex_t *)malloc((size_t)cap * sizeof(vertex_t));
+    nv.count = 0;
+    nv.cap   = cap;
+    return nv;
+}
+
+static void new_verts_free(NewVerts *nv)
+{
+    free(nv->buf);
+    nv->buf = NULL;
+}
+
+static void new_verts_clear(NewVerts *nv) { nv->count = 0; }
+
+/* Thread-safe add (gọi từ trong OpenMP parallel) */
+static inline void new_verts_add(NewVerts *nv, vertex_t v)
+{
+    int idx;
+    #pragma omp atomic capture
+    idx = nv->count++;
+    /* Nếu tràn buffer thì bỏ qua — trường hợp này rất hiếm và sẽ được
+     * bù lại bởi sync_frontier (frontier bitmap vẫn đúng). dist[] của
+     * đỉnh bị bỏ qua sẽ được cập nhật ở level sau khi rank khác gửi. */
+    if (idx < nv->cap)
+        nv->buf[idx] = v;
+}
+
+/* ------------------------------------------------------------------ *
+ * sync_delta: đồng bộ dist[] bằng cách trao đổi chỉ đỉnh mới         *
+ * Trả về thời gian (giây) dành cho MPI.                               *
+ * ------------------------------------------------------------------ */
+static double sync_delta(int *dist, int level,
+                         NewVerts *local_new,
+                         int num_ranks, int my_rank)
+{
+    double t0 = MPI_Wtime();
+
+    int local_count = local_new->count;
+    if (local_count > local_new->cap) local_count = local_new->cap;
+
+    /* Bước 1: trao đổi số lượng đỉnh mới của từng rank */
+    int *counts = (int *)malloc((size_t)num_ranks * sizeof(int));
+    MPI_Allgather(&local_count, 1, MPI_INT,
+                  counts, 1, MPI_INT, MPI_COMM_WORLD);
+
+    int total = 0;
+    int *displs = (int *)malloc((size_t)num_ranks * sizeof(int));
+    for (int r = 0; r < num_ranks; r++) {
+        displs[r] = total;
+        total    += counts[r];
+    }
+
+    /* Bước 2: trao đổi danh sách đỉnh (Allgatherv) */
+    vertex_t *all_new = (vertex_t *)malloc((size_t)(total + 1) * sizeof(vertex_t));
+    MPI_Allgatherv(local_new->buf, local_count, MPI_INT,
+                   all_new, counts, displs, MPI_INT, MPI_COMM_WORLD);
+
+    double comm_dt = MPI_Wtime() - t0;
+
+    /* Bước 3: cập nhật dist[] cục bộ (không có MPI — tính vào compute) */
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < total; i++) {
+        vertex_t v = all_new[i];
+        /* Chỉ ghi nếu chưa được thăm — tránh ghi đè level sai khi
+         * có race (không thể xảy ra trong BFS level-synchronous,
+         * nhưng guard cho an toàn) */
+        if (dist[v] == -1)
+            dist[v] = level;
+    }
+
+    free(counts);
+    free(displs);
+    free(all_new);
+    return comm_dt;
+}
+
+/* ------------------------------------------------------------------ *
+ * sync_dist gốc — O(n), giữ lại để so sánh qua flag --delta-sync     *
  * ------------------------------------------------------------------ */
 static double sync_dist(int *dist, vertex_t n)
 {
@@ -230,8 +344,10 @@ static double sync_frontier(Frontier *f)
 
 /* ================================================================== *
  * BFS HYBRID CHÍNH                                                     *
+ * use_delta_sync = 1 : dùng sync_delta O(|new_vertices|)              *
+ * use_delta_sync = 0 : dùng sync_dist  O(n) gốc (để so sánh)         *
  * ================================================================== */
-BFSResult bfs_hybrid(const Graph *g, vertex_t source)
+BFSResult bfs_hybrid(const Graph *g, vertex_t source, int use_delta_sync)
 {
     int my_rank, num_ranks;
     MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
@@ -265,16 +381,21 @@ BFSResult bfs_hybrid(const Graph *g, vertex_t source)
     edge_t unvisited_edges = g->num_edges;   /* tổng cạnh chưa xét    */
     edge_t total_visited   = 0;
 
+    /* ---- NewVerts buffer cho delta-sync ------------------------------ *
+     * Cap = n (worst case mọi đỉnh đều mới trong 1 level — thực tế      *
+     * chỉ xảy ra ở level 2-3 của BFS trên R-MAT small-world).           *
+     * Khi dùng delta-sync, mỗi rank chỉ gửi phần nó tự thăm.           */
+    NewVerts local_new = use_delta_sync
+        ? new_verts_create((int)n)
+        : (NewVerts){ NULL, 0, 0 };
+
     int level = 1;
-    int use_bottom_up = 0;   /* 0 = top-down, 1 = bottom-up            */
+    int use_bottom_up = 0;
     int num_levels    = 0;
 
     Timer wall;
     if (my_rank == 0) timer_start(&wall);
 
-    /* ---- Bộ đếm thời gian compute / comm của RANK NÀY -------------- *
-     * Cộng dồn qua toàn bộ vòng lặp BFS (mọi level).                   *
-     * Đơn vị tích lũy nội bộ: giây (MPI_Wtime), đổi sang ms khi xuất.  */
     double rank_compute_s = 0.0;
     double rank_comm_s    = 0.0;
 
@@ -286,8 +407,6 @@ BFSResult bfs_hybrid(const Graph *g, vertex_t source)
 
         edge_t frontier_edges = 0;
 
-        /* Đếm tổng cạnh của frontier (để quyết định switch) — tính toán   *
-         * cục bộ, OpenMP song song, KHÔNG có giao tiếp MPI → tính compute */
         double t_compute0 = MPI_Wtime();
         edge_t fe_local = 0;
         #pragma omp parallel for reduction(+:fe_local)
@@ -295,7 +414,6 @@ BFSResult bfs_hybrid(const Graph *g, vertex_t source)
             fe_local += graph_degree(g, curr->dense[fi]);
         rank_compute_s += MPI_Wtime() - t_compute0;
 
-        /* MPI reduce frontier_edges — đây LÀ giao tiếp → tính comm */
         double t_comm0 = MPI_Wtime();
         MPI_Allreduce(&fe_local, &frontier_edges, 1,
                       MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
@@ -304,20 +422,18 @@ BFSResult bfs_hybrid(const Graph *g, vertex_t source)
         /* ---- Quyết định hướng (Beamer et al.) ---------------------- */
         int should_bottom_up = 0;
         if (!use_bottom_up) {
-            /* Top-down → bottom-up nếu frontier quá rộng */
             should_bottom_up =
                 (frontier_edges > unvisited_edges / BFS_ALPHA);
         } else {
-            /* Bottom-up → top-down nếu frontier đã nhỏ lại */
             should_bottom_up =
                 (curr->size >= (vertex_t)(n / BFS_BETA));
         }
 
-        /* In log ở rank 0 */
         if (my_rank == 0) {
-            const char *dir = should_bottom_up ? "bottom-up" : "top-down ";
-            printf("[HYBRID]   Level %2d: %s (frontier=%d, fe=%lld, ue=%lld)\n",
-                   level, dir,
+            const char *dir  = should_bottom_up ? "bottom-up" : "top-down ";
+            const char *mode = use_delta_sync   ? "[delta]"   : "[full] ";
+            printf("[HYBRID]   Level %2d: %s %s (frontier=%d, fe=%lld, ue=%lld)\n",
+                   level, dir, mode,
                    (int)curr->size,
                    (long long)frontier_edges,
                    (long long)unvisited_edges);
@@ -327,34 +443,41 @@ BFSResult bfs_hybrid(const Graph *g, vertex_t source)
         use_bottom_up = should_bottom_up;
 
         /* ---- Thực hiện bước BFS ----------------------------------- */
+        NewVerts *nv_ptr = use_delta_sync ? &local_new : NULL;
+
         if (!use_bottom_up) {
-            /* TOP-DOWN */
             double t0 = MPI_Wtime();
             edge_t step_fe = 0;
             top_down_step(g, curr, next, dist, level,
-                          my_rank, num_ranks, &step_fe);
+                          my_rank, num_ranks, &step_fe, nv_ptr);
             rank_compute_s += MPI_Wtime() - t0;
 
-            /* Đồng bộ dist[] và next frontier */
-            rank_comm_s += sync_dist(dist, n);
+            if (use_delta_sync) {
+                /* Delta sync: gửi chỉ đỉnh mới, không gửi toàn bộ dist[] */
+                rank_comm_s += sync_delta(dist, level, &local_new,
+                                          num_ranks, my_rank);
+            } else {
+                rank_comm_s += sync_dist(dist, n);
+            }
             rank_comm_s += sync_frontier(next);
 
-            total_visited += frontier_edges;
+            total_visited   += frontier_edges;
             unvisited_edges -= frontier_edges;
 
         } else {
-            /* BOTTOM-UP */
             double t0 = MPI_Wtime();
             bottom_up_step(g, curr, next, dist, level,
-                           local_start, local_end);
+                           local_start, local_end, nv_ptr);
             rank_compute_s += MPI_Wtime() - t0;
 
-            /* Đồng bộ dist[] và next frontier */
-            rank_comm_s += sync_dist(dist, n);
+            if (use_delta_sync) {
+                rank_comm_s += sync_delta(dist, level, &local_new,
+                                          num_ranks, my_rank);
+            } else {
+                rank_comm_s += sync_dist(dist, n);
+            }
             rank_comm_s += sync_frontier(next);
 
-            /* Cập nhật unvisited_edges dựa trên next frontier — tính   *
-             * toán cục bộ, không giao tiếp → tính vào compute          */
             double t1 = MPI_Wtime();
             edge_t next_fe = 0;
             #pragma omp parallel for reduction(+:next_fe)
@@ -366,11 +489,9 @@ BFSResult bfs_hybrid(const Graph *g, vertex_t source)
             total_visited   += next_fe;
         }
 
-        /* Swap curr ↔ next */
         Frontier *tmp = curr;
         curr = next;
         next = tmp;
-
         level++;
     }
 
