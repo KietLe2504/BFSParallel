@@ -6,9 +6,6 @@
 #include <math.h>
 #include <assert.h>
 
-/* ------------------------------------------------------------------ *
- * Bộ sinh số ngẫu nhiên nhanh (xorshift64)                            *
- * ------------------------------------------------------------------ */
 static uint64_t xorshift64(uint64_t *state)
 {
     uint64_t x = *state;
@@ -25,30 +22,24 @@ static inline double rand_double(uint64_t *state)
     return (double)(xorshift64(state) >> 11) / (double)(1ULL << 53);
 }
 
-/* ------------------------------------------------------------------ *
- * Sinh một cạnh R-MAT                                                  *
- *                                                                      *
- * R-MAT chia ma trận kề thành 4 góc (a, b, c, d).                     *
- * Mỗi vòng lặp thu nhỏ ô được chọn, tích lũy offset (u, v).           *
- * ------------------------------------------------------------------ */
+
 static void rmat_edge(vertex_t n, const RMATParams *p,
                       uint64_t *state,
                       vertex_t *out_u, vertex_t *out_v)
 {
     vertex_t u = 0, v = 0;
-    vertex_t step = n;          /* kích thước ô hiện tại                */
+    vertex_t step = n;         
 
     while (step > 1) {
-        step >>= 1;             /* chia đôi                             */
+        step >>= 1;             
         double r = rand_double(state);
         if (r < p->a) {
-            /* góc trên-trái: u, v không đổi */
         } else if (r < p->a + p->b) {
-            v += step;          /* góc trên-phải                        */
+            v += step;         
         } else if (r < p->a + p->b + p->c) {
-            u += step;          /* góc dưới-trái                        */
+            u += step;        
         } else {
-            u += step;          /* góc dưới-phải                        */
+            u += step;        
             v += step;
         }
     }
@@ -56,9 +47,6 @@ static void rmat_edge(vertex_t n, const RMATParams *p,
     *out_v = v;
 }
 
-/* ------------------------------------------------------------------ *
- * Cấu trúc tạm lưu danh sách cạnh trước khi build CSR                 *
- * ------------------------------------------------------------------ */
 typedef struct {
     vertex_t u, v;
 } Edge;
@@ -71,20 +59,15 @@ static int edge_cmp(const void *a, const void *b)
     return (ea->v > eb->v) - (ea->v < eb->v);
 }
 
-/* ------------------------------------------------------------------ *
- * graph_rmat_generate                                                   *
- * ------------------------------------------------------------------ */
 Graph *graph_rmat_generate(vertex_t num_vertices,
                            int      scale_factor,
                            uint64_t seed,
                            const RMATParams *params)
 {
-    /* Tham số mặc định Graph500 */
+ 
     RMATParams default_params = {0.57, 0.19, 0.19, 0.05};
     if (!params) params = &default_params;
 
-    /* num_vertices phải là lũy thừa 2 để R-MAT hoạt động đúng.        *
-     * Làm tròn lên lũy thừa 2 gần nhất.                                */
     vertex_t n = 1;
     while (n < num_vertices) n <<= 1;
 
@@ -93,10 +76,7 @@ Graph *graph_rmat_generate(vertex_t num_vertices,
     fprintf(stderr, "[GRAPH] Generating R-MAT: n=%d, target_edges=%lld, seed=%llu\n",
             n, (long long)target_edges, (unsigned long long)seed);
 
-    /* ---------------------------------------------------------------- *
-     * Sinh cạnh                                                         *
-     * Cấp phát tối đa 2 * target_edges (mỗi cạnh thêm 2 chiều)        *
-     * ---------------------------------------------------------------- */
+
     edge_t raw_cap = target_edges * 2 + 16;
     Edge  *edges   = (Edge *)malloc((size_t)raw_cap * sizeof(Edge));
     if (!edges) {
@@ -111,15 +91,12 @@ Graph *graph_rmat_generate(vertex_t num_vertices,
         vertex_t u, v;
         rmat_edge(n, params, &state, &u, &v);
 
-        /* Bỏ self-loop */
         if (u == v) continue;
 
-        /* Vô hướng: thêm cả 2 chiều */
         edges[nedges].u = u;  edges[nedges].v = v;  nedges++;
         edges[nedges].u = v;  edges[nedges].v = u;  nedges++;
 
         if (nedges >= raw_cap - 4) {
-            /* Mở rộng buffer nếu cần */
             raw_cap *= 2;
             Edge *tmp = (Edge *)realloc(edges, (size_t)raw_cap * sizeof(Edge));
             if (!tmp) { free(edges); return NULL; }
@@ -127,9 +104,6 @@ Graph *graph_rmat_generate(vertex_t num_vertices,
         }
     }
 
-    /* ---------------------------------------------------------------- *
-     * Sắp xếp và loại bỏ cạnh trùng                                    *
-     * ---------------------------------------------------------------- */
     qsort(edges, (size_t)nedges, sizeof(Edge), edge_cmp);
 
     edge_t unique = 0;
@@ -146,9 +120,7 @@ Graph *graph_rmat_generate(vertex_t num_vertices,
     fprintf(stderr, "[GRAPH] After dedup: %lld edges (avg degree %.2f)\n",
             (long long)nedges, (double)nedges / n);
 
-    /* ---------------------------------------------------------------- *
-     * Build CSR                                                          *
-     * ---------------------------------------------------------------- */
+
     Graph *g = (Graph *)malloc(sizeof(Graph));
     if (!g) { free(edges); return NULL; }
 
@@ -162,15 +134,12 @@ Graph *graph_rmat_generate(vertex_t num_vertices,
         return NULL;
     }
 
-    /* Đếm bậc */
     for (edge_t i = 0; i < nedges; i++)
         g->row_ptr[edges[i].u + 1]++;
 
-    /* Prefix sum → row_ptr */
     for (vertex_t v = 0; v < n; v++)
         g->row_ptr[v + 1] += g->row_ptr[v];
 
-    /* Điền adj */
     edge_t *tmp_pos = (edge_t *)malloc((size_t)n * sizeof(edge_t));
     if (!tmp_pos) {
         free(g->row_ptr); free(g->adj); free(g); free(edges);
@@ -198,9 +167,6 @@ void graph_free(Graph *g)
     free(g);
 }
 
-/* ------------------------------------------------------------------ *
- * graph_save / graph_load — lưu và nạp đồ thị dạng binary CSR        *
- * ------------------------------------------------------------------ */
 #define GRAPH_MAGIC  0x4246535f43535200ULL   /* "BFS_CSR\0" */
 
 int graph_save(const Graph *g, const char *path)

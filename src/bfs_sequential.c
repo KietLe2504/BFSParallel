@@ -8,10 +8,10 @@ edge_t bfs_sequential(const Graph *g, vertex_t source, int *dist)
 {
     vertex_t n = g->num_vertices;
 
-    /* Khởi tạo dist[] = -1 */
+    //Khởi tạo dist[] = -1 
     memset(dist, -1, (size_t)n * sizeof(int));
 
-    /* Queue vòng tròn */
+    //Queue vòng tròn 
     vertex_t *queue = (vertex_t *)malloc((size_t)n * sizeof(vertex_t));
     if (!queue) {
         fprintf(stderr, "[SEQ] malloc queue failed\n");

@@ -5,9 +5,6 @@
 #include <time.h>
 #include <string.h>
 
-/* ------------------------------------------------------------------ *
- * Timer                                                                *
- * ------------------------------------------------------------------ */
 void timer_start(Timer *t)
 {
     clock_gettime(CLOCK_MONOTONIC, &t->_start);
@@ -22,9 +19,6 @@ double timer_elapsed_ms(const Timer *t)
     return sec * 1000.0 + nsec / 1e6;
 }
 
-/* ------------------------------------------------------------------ *
- * Metrics                                                              *
- * ------------------------------------------------------------------ */
 double compute_mteps(edge_t visited_edges, double elapsed_ms)
 {
     if (elapsed_ms <= 0.0) return 0.0;
@@ -55,9 +49,6 @@ int verify_bfs(const int *dist_ref, const int *dist_test,
     return errors;
 }
 
-/* ------------------------------------------------------------------ *
- * Chọn đỉnh nguồn hợp lệ (bậc > 0)                                    *
- * ------------------------------------------------------------------ */
 vertex_t pick_source(const Graph *g, uint64_t seed)
 {
     /* Thử seed trước */
@@ -71,9 +62,6 @@ vertex_t pick_source(const Graph *g, uint64_t seed)
     return 0;  /* đồ thị rỗng? */
 }
 
-/* ------------------------------------------------------------------ *
- * Progress bar                                                         *
- * ------------------------------------------------------------------ */
 void print_progress(long long current, long long total, const char *label)
 {
     int pct = (int)((double)current / total * 100);
