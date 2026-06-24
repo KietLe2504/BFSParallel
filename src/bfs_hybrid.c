@@ -38,6 +38,12 @@
 #define WORD_BITS  64
 #define BIT_WORD(v)  ((v) / WORD_BITS)
 #define BIT_MASK(v)  (1ULL << ((v) % WORD_BITS))
+/* Mảng đỉnh mới tích lũy trong 1 step — mỗi rank giữ riêng */
+typedef struct {
+    vertex_t *buf;     /* buffer đỉnh mới                                */
+    int       count;   /* số đỉnh đã thêm                                */
+    int       cap;     /* dung lượng buffer                              */
+} NewVerts;
 
 typedef struct {
     uint64_t *bitmap;     /* kích thước ceil(n/64) words               */
@@ -227,13 +233,6 @@ static void bottom_up_step(const Graph    *g,
  * Lưu ý: Allgatherv có latency cao hơn Allreduce (cần P round-trips   *
  * thay vì log P), nên chỉ có lợi khi message nhỏ hơn ngưỡng.         *
  * ------------------------------------------------------------------ */
-
-/* Mảng đỉnh mới tích lũy trong 1 step — mỗi rank giữ riêng */
-typedef struct {
-    vertex_t *buf;     /* buffer đỉnh mới                                */
-    int       count;   /* số đỉnh đã thêm                                */
-    int       cap;     /* dung lượng buffer                              */
-} NewVerts;
 
 static NewVerts new_verts_create(int cap)
 {
