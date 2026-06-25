@@ -152,10 +152,11 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    vertex_t num_vertices = (vertex_t)atoi(argv[1]);
-    int      scale        = atoi(argv[2]);
-    uint64_t seed         = (uint64_t)atoll(argv[3]);
-    int      do_verify    = has_flag(argc, argv, "--verify");
+    vertex_t num_vertices   = (vertex_t)atoi(argv[1]);
+    int      scale          = atoi(argv[2]);
+    uint64_t seed           = (uint64_t)atoll(argv[3]);
+    int      do_verify      = has_flag(argc, argv, "--verify");
+    int      use_delta_sync = has_flag(argc, argv, "--delta-sync");
     const char *csv_path        = find_flag_value(argc, argv, "--csv");
     const char *csv_ranks_path  = find_flag_value(argc, argv, "--csv-ranks");
     const char *graph_load_path = find_flag_value(argc, argv, "--graph");
@@ -252,6 +253,9 @@ int main(int argc, char *argv[])
     /* ---- Chọn source --------------------------------------------- */
     vertex_t source = pick_source(g, seed);
     if (my_rank == 0) {
+        printf("[HYBRID] Sync mode  : %s\n",
+               use_delta_sync ? "DELTA (Allgatherv new vertices)"
+                              : "FULL  (Allreduce dist[], O(n))");
         printf("[HYBRID] BFS from source vertex %d\n\n", source);
         fflush(stdout);
     }
@@ -259,7 +263,7 @@ int main(int argc, char *argv[])
     /* ---- Chạy BFS Hybrid ----------------------------------------- */
     MPI_Barrier(MPI_COMM_WORLD);
 
-    BFSResult result = bfs_hybrid(g, source);
+    BFSResult result = bfs_hybrid(g, source, use_delta_sync);
 
     MPI_Barrier(MPI_COMM_WORLD);
 
